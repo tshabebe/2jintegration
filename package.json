@@ -1,10 +1,10 @@
 {
-  "name": "express-hello-world",
+  "name": "2jintegration",
   "version": "1.0.0",
-  "description": "Express Hello World on Render",
+  "description": "Simple Express app deployed on Render",
   "main": "app.js",
-  "repository": "https://github.com/render-examples/express-hello-world",
-  "author": "Render Developers",
+  "repository": "https://github.com/tshabebe/2jintegration",
+  "author": "teshome",
   "license": "MIT",
   "private": false,
   "scripts": {

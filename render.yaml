@@ -1,9 +1,9 @@
 services:
   - type: web
-    name: express-hello-world
+    name: 2jintegration
     runtime: node
     plan: free
-    buildCommand: yarn install --frozen-lockfile
+    buildCommand: npm install
     startCommand: node app.js
     envVars:
       - key: NODE_ENV

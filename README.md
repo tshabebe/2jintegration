@@ -1,15 +1,19 @@
-# README
+# 2jintegration
 
-This is the [Express](https://expressjs.com) [Hello world](https://expressjs.com/en/starter/hello-world.html) example on [Render](https://render.com).
+Simple Express starter based on Render's official `express-hello-world` template.
 
-The app in this repo is deployed at [https://express.onrender.com](https://express.onrender.com).
+## Local Development
 
-## Deployment
+```bash
+npm install
+npm start
+```
 
-See https://render.com/docs/deploy-node-express-app or follow the steps below:
+The app listens on `PORT`, defaulting to `3001`.
 
-Create a new web service with the following values:
-  * Build Command: `yarn`
-  * Start Command: `node app.js`
+## Render Deployment
 
-That's it! Your web service will be live on your Render URL as soon as the build finishes.
+This repo includes a [render.yaml](/home/teshe/projects/2jintegration/render.yaml) blueprint for a Node web service:
+
+- Build command: `npm install`
+- Start command: `node app.js`
