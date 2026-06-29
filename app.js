@@ -13,7 +13,7 @@ const businessEvents = [];
 
 const config = {
   port,
-  baseUrl: process.env.APP_BASE_URL || `http://localhost:${port}`,
+  baseUrl: process.env.APP_BASE_URL || "",
   twoJBaseUrl: process.env.TWOJ_BASE_URL || "https://2j.com",
   merchantId: process.env.TWOJ_MCH_ID || "",
   merchantKey: process.env.TWOJ_MERCHANT_KEY || "",
@@ -80,6 +80,16 @@ function build2JUrl(pathname, timestamp, sign) {
 
 function require2JCredentials() {
   return Boolean(config.merchantId && config.merchantKey);
+}
+
+function getPublicBaseUrl(req) {
+  if (config.baseUrl) {
+    return config.baseUrl;
+  }
+
+  const protocol = req.get("x-forwarded-proto") || req.protocol || "http";
+  const host = req.get("x-forwarded-host") || req.get("host");
+  return host ? `${protocol}://${host}` : `http://localhost:${port}`;
 }
 
 function getOrCreateUser(opId, seed = {}) {
@@ -194,6 +204,8 @@ async function postTo2J(pathname, body) {
 }
 
 app.get("/", (req, res) => {
+  const publicBaseUrl = getPublicBaseUrl(req);
+
   res.type("html").send(`
 <!DOCTYPE html>
 <html lang="en">
@@ -251,7 +263,7 @@ app.get("/", (req, res) => {
       <h1>2J Seamless Wallet Gateway</h1>
       <p>This service exposes the OP callbacks required by 2J seamless-wallet mode and helper endpoints for signed 2J API calls.</p>
       <p>Health check: <code>GET /health</code></p>
-      <p>Callback base: <code>${config.baseUrl}</code></p>
+      <p>Callback base: <code>${publicBaseUrl}</code></p>
     </main>
   </body>
 </html>
@@ -263,7 +275,7 @@ app.get("/health", (req, res) => {
     ok: true,
     service: "2jintegration",
     timestamp: nowMs(),
-    callbackBaseUrl: config.baseUrl,
+    callbackBaseUrl: getPublicBaseUrl(req),
     twoJBaseUrl: config.twoJBaseUrl,
   });
 });
@@ -540,7 +552,7 @@ app.post("/api/2j/launch-game", async (req, res) => {
       op_id: user.op_id,
       game_id: Number(gameId),
       lang: lang || "en-US",
-      backlink: backlink || config.baseUrl,
+      backlink: backlink || getPublicBaseUrl(req),
       device_type: deviceType,
       device_id: deviceId,
       ret_lobby_btn: retLobbyBtn,
