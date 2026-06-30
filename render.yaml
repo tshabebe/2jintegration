@@ -16,12 +16,12 @@ services:
       - key: NODE_ENV
         value: production
       - key: TWOJ_BASE_URL
-        value: https://2j.com
+        value: https://open.localus111.link
       - key: TWOJ_MCH_ID
         sync: false
       - key: TWOJ_MERCHANT_KEY
         sync: false
       - key: TWOJ_DEFAULT_COUNTRY
-        value: US
+        value: ET
       - key: TWOJ_DEFAULT_LANGUAGE
         value: en
