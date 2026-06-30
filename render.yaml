@@ -25,3 +25,15 @@ services:
         value: ET
       - key: TWOJ_DEFAULT_LANGUAGE
         value: en
+      - key: LOBBY_USERNAME
+        sync: false
+      - key: LOBBY_PASSWORD
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: DEMO_OP_ID
+        value: giftbet-demo-player
+      - key: DEMO_NICKNAME
+        value: GiftBet Demo
+      - key: DEMO_BALANCE_BIRR
+        value: 10000
