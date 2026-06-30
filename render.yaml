@@ -9,6 +9,10 @@ services:
     envVars:
       - key: APP_BASE_URL
         value: https://twojintegration.onrender.com
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB_NAME
+        value: 2jintegration
       - key: NODE_ENV
         value: production
       - key: TWOJ_BASE_URL

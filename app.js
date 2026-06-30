@@ -1,19 +1,17 @@
 const crypto = require("crypto");
 const express = require("express");
+const mongoose = require("mongoose");
 
 const app = express();
 const port = Number(process.env.PORT || 3001);
 
 app.use(express.json({ limit: "1mb" }));
 
-const users = new Map();
-const processedTransfers = new Map();
-const processedBatchTransfers = new Map();
-const businessEvents = [];
-
 const config = {
   port,
   baseUrl: process.env.APP_BASE_URL || "",
+  mongoUri: process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/2jintegration",
+  mongoDbName: process.env.MONGODB_DB_NAME || "",
   twoJBaseUrl: process.env.TWOJ_BASE_URL || "https://2j.com",
   merchantId: process.env.TWOJ_MCH_ID || "",
   merchantKey: process.env.TWOJ_MERCHANT_KEY || "",
@@ -27,6 +25,48 @@ const errorCodes = {
   userNotFound: 103,
   insufficientBalance: 108,
 };
+
+const userSchema = new mongoose.Schema(
+  {
+    op_id: { type: String, required: true, unique: true, index: true },
+    nickname: { type: String, required: true },
+    gender: { type: Number, default: 0 },
+    availableAmount: { type: Number, default: 1_000_000 },
+    cnt: { type: String, default: config.defaultCountry },
+    lan: { type: String, default: config.defaultLanguage },
+    meta: { type: mongoose.Schema.Types.Mixed, default: {} },
+  },
+  { timestamps: true, versionKey: false }
+);
+
+const transferSchema = new mongoose.Schema(
+  {
+    transactionKey: { type: String, required: true, unique: true, index: true },
+    kind: { type: String, enum: ["single", "batch"], required: true },
+    action: { type: String, required: true },
+    op_id: { type: String, default: null },
+    trans_no: { type: String, required: true },
+    amount: { type: Number, default: null },
+    batchResult: { type: mongoose.Schema.Types.Mixed, default: null },
+    result: {
+      op_id: { type: String, default: null },
+      availableAmount: { type: Number, default: null },
+      code: { type: Number, default: errorCodes.success },
+    },
+  },
+  { timestamps: true, versionKey: false }
+);
+
+const businessEventSchema = new mongoose.Schema(
+  {
+    payload: { type: mongoose.Schema.Types.Mixed, required: true },
+  },
+  { timestamps: true, versionKey: false }
+);
+
+const User = mongoose.model("User", userSchema);
+const Transfer = mongoose.model("Transfer", transferSchema);
+const BusinessEvent = mongoose.model("BusinessEvent", businessEventSchema);
 
 function nowMs() {
   return Date.now();
@@ -92,40 +132,62 @@ function getPublicBaseUrl(req) {
   return host ? `${protocol}://${host}` : `http://localhost:${port}`;
 }
 
-function getOrCreateUser(opId, seed = {}) {
-  if (!users.has(opId)) {
-    users.set(opId, {
-      op_id: opId,
-      nickname: seed.nickname || opId,
-      gender: seed.gender ?? 0,
-      availableAmount: Number(seed.availableAmount ?? 1_000_000),
-      cnt: seed.cnt || config.defaultCountry,
-      lan: seed.lan || config.defaultLanguage,
+function normalizeUser(user) {
+  return {
+    op_id: user.op_id,
+    nickname: user.nickname,
+    gender: user.gender,
+    availableAmount: user.availableAmount,
+    cnt: user.cnt,
+    lan: user.lan,
+    meta: user.meta || {},
+  };
+}
+
+async function getOrCreateUser(opId, seed = {}) {
+  await User.updateOne(
+    { op_id: opId },
+    {
+      $setOnInsert: {
+        op_id: opId,
+        nickname: seed.nickname || opId,
+        gender: seed.gender ?? 0,
+        availableAmount: Number(seed.availableAmount ?? 1_000_000),
+        cnt: seed.cnt || config.defaultCountry,
+        lan: seed.lan || config.defaultLanguage,
+        meta: seed.meta || {},
+      },
+    },
+    { upsert: true }
+  );
+
+  return User.findOne({ op_id: opId }).lean();
+}
+
+async function getExistingUser(opId) {
+  return User.findOne({ op_id: opId }).lean();
+}
+
+async function upsertUserFromProfile(payload) {
+  const update = {
+    $setOnInsert: {
+      op_id: payload.op_id,
+      availableAmount: 1_000_000,
       meta: {},
-    });
-  }
+    },
+    $set: {
+      nickname: payload.user_info?.nickname || payload.op_id,
+      gender: payload.user_info?.gender ?? 0,
+      cnt: payload.user_info?.cnt || config.defaultCountry,
+      lan: payload.user_info?.lan || config.defaultLanguage,
+    },
+  };
 
-  return users.get(opId);
-}
-
-function getExistingUser(opId) {
-  return users.get(opId) || null;
-}
-
-function upsertUserFromProfile(payload) {
-  const user = getOrCreateUser(payload.op_id, {
-    nickname: payload.user_info?.nickname,
-    gender: payload.user_info?.gender,
-    cnt: payload.user_info?.cnt,
-    lan: payload.user_info?.lan,
+  return User.findOneAndUpdate({ op_id: payload.op_id }, update, {
+    upsert: true,
+    new: true,
+    lean: true,
   });
-
-  user.nickname = payload.user_info?.nickname || user.nickname;
-  user.gender = payload.user_info?.gender ?? user.gender;
-  user.cnt = payload.user_info?.cnt || user.cnt;
-  user.lan = payload.user_info?.lan || user.lan;
-
-  return user;
 }
 
 function sendUserResult(res, user) {
@@ -145,9 +207,26 @@ function sendError(res, code, msg, extra = {}) {
   });
 }
 
-function applyTransfer(user, amount, transactionKey) {
-  const nextAmount = user.availableAmount + amount;
-  if (nextAmount < 0) {
+async function applySingleTransfer({ user, amount, transactionKey, action, transNo }) {
+  const existing = await Transfer.findOne({ transactionKey }).lean();
+  if (existing) {
+    return {
+      ok: true,
+      duplicate: true,
+      op_id: existing.result.op_id,
+      availableAmount: existing.result.availableAmount,
+    };
+  }
+
+  const updatedUser = await User.findOneAndUpdate(
+    amount < 0
+      ? { op_id: user.op_id, availableAmount: { $gte: Math.abs(amount) } }
+      : { op_id: user.op_id },
+    { $inc: { availableAmount: amount } },
+    { new: true, lean: true }
+  );
+
+  if (!updatedUser) {
     return {
       ok: false,
       code: errorCodes.insufficientBalance,
@@ -155,17 +234,77 @@ function applyTransfer(user, amount, transactionKey) {
     };
   }
 
-  user.availableAmount = nextAmount;
-  processedTransfers.set(transactionKey, {
-    op_id: user.op_id,
-    availableAmount: user.availableAmount,
-  });
+  try {
+    await Transfer.create({
+      transactionKey,
+      kind: "single",
+      action,
+      op_id: user.op_id,
+      trans_no: transNo,
+      amount,
+      result: {
+        op_id: updatedUser.op_id,
+        availableAmount: updatedUser.availableAmount,
+        code: errorCodes.success,
+      },
+    });
+  } catch (error) {
+    if (error.code === 11000) {
+      const duplicate = await Transfer.findOne({ transactionKey }).lean();
+      return {
+        ok: true,
+        duplicate: true,
+        op_id: duplicate.result.op_id,
+        availableAmount: duplicate.result.availableAmount,
+      };
+    }
+    throw error;
+  }
 
   return {
     ok: true,
-    op_id: user.op_id,
-    availableAmount: user.availableAmount,
+    op_id: updatedUser.op_id,
+    availableAmount: updatedUser.availableAmount,
   };
+}
+
+async function getStoredBatchTransfer(transactionKey) {
+  const existing = await Transfer.findOne({ transactionKey }).lean();
+  return existing?.batchResult || null;
+}
+
+async function storeBatchTransfer({ transactionKey, action, transNo, batchResult }) {
+  try {
+    await Transfer.create({
+      transactionKey,
+      kind: "batch",
+      action,
+      trans_no: transNo,
+      batchResult,
+      result: {
+        op_id: null,
+        availableAmount: null,
+        code: batchResult.header.code,
+      },
+    });
+  } catch (error) {
+    if (error.code !== 11000) {
+      throw error;
+    }
+  }
+}
+
+async function trimBusinessEvents(limit = 200) {
+  const count = await BusinessEvent.countDocuments();
+  if (count <= limit) {
+    return;
+  }
+
+  const overflow = count - limit;
+  const stale = await BusinessEvent.find().sort({ createdAt: 1 }).limit(overflow).select("_id").lean();
+  if (stale.length > 0) {
+    await BusinessEvent.deleteMany({ _id: { $in: stale.map((item) => item._id) } });
+  }
 }
 
 async function postTo2J(pathname, body) {
@@ -201,6 +340,12 @@ async function postTo2J(pathname, body) {
   }
 
   return data;
+}
+
+function asyncHandler(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
 }
 
 app.get("/", (req, res) => {
@@ -270,15 +415,22 @@ app.get("/", (req, res) => {
   `);
 });
 
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "2jintegration",
-    timestamp: nowMs(),
-    callbackBaseUrl: getPublicBaseUrl(req),
-    twoJBaseUrl: config.twoJBaseUrl,
-  });
-});
+app.get(
+  "/health",
+  asyncHandler(async (req, res) => {
+    res.json({
+      ok: true,
+      service: "2jintegration",
+      timestamp: nowMs(),
+      callbackBaseUrl: getPublicBaseUrl(req),
+      twoJBaseUrl: config.twoJBaseUrl,
+      database: {
+        readyState: mongoose.connection.readyState,
+        name: mongoose.connection.name || null,
+      },
+    });
+  })
+);
 
 app.get("/api/docs", (req, res) => {
   res.json({
@@ -298,217 +450,281 @@ app.get("/api/docs", (req, res) => {
   });
 });
 
-app.post("/api/dev/users/upsert", (req, res) => {
-  const { op_id: opId, nickname, gender, availableAmount, cnt, lan } = req.body || {};
+app.post(
+  "/api/dev/users/upsert",
+  asyncHandler(async (req, res) => {
+    const { op_id: opId, nickname, gender, availableAmount, cnt, lan } = req.body || {};
 
-  if (!opId) {
-    return sendError(res, errorCodes.invalidRequest, "op_id is required");
-  }
+    if (!opId) {
+      return sendError(res, errorCodes.invalidRequest, "op_id is required");
+    }
 
-  const user = getOrCreateUser(opId, {
-    nickname,
-    gender,
-    availableAmount,
-    cnt,
-    lan,
-  });
-
-  if (nickname) {
-    user.nickname = nickname;
-  }
-  if (gender !== undefined) {
-    user.gender = gender;
-  }
-  if (availableAmount !== undefined) {
-    user.availableAmount = Number(availableAmount);
-  }
-  if (cnt) {
-    user.cnt = cnt;
-  }
-  if (lan) {
-    user.lan = lan;
-  }
-
-  res.json({
-    ok: true,
-    user,
-  });
-});
-
-app.get("/api/dev/users", (req, res) => {
-  res.json({
-    users: [...users.values()],
-    processedTransfers: [...processedTransfers.entries()],
-    processedBatchTransfers: [...processedBatchTransfers.entries()],
-    businessEvents,
-  });
-});
-
-app.post("/balance/get", (req, res) => {
-  const { op_id: opId } = req.body || {};
-  const user = getExistingUser(opId);
-
-  if (!user) {
-    return sendError(res, errorCodes.userNotFound, "user not exist", {
-      result: {
-        op_id: opId || "",
-        availableAmount: 0,
+    const update = {
+      $setOnInsert: {
+        op_id: opId,
+        meta: {},
       },
+      $set: {},
+    };
+
+    if (nickname) {
+      update.$set.nickname = nickname;
+    }
+    if (gender !== undefined) {
+      update.$set.gender = gender;
+    }
+    if (availableAmount !== undefined) {
+      update.$set.availableAmount = Number(availableAmount);
+    }
+    if (cnt) {
+      update.$set.cnt = cnt;
+    }
+    if (lan) {
+      update.$set.lan = lan;
+    }
+
+    if (!update.$set.nickname) {
+      update.$set.nickname = opId;
+    }
+    if (update.$set.gender === undefined) {
+      update.$set.gender = 0;
+    }
+    if (!update.$set.cnt) {
+      update.$set.cnt = config.defaultCountry;
+    }
+    if (!update.$set.lan) {
+      update.$set.lan = config.defaultLanguage;
+    }
+    if (update.$set.availableAmount === undefined) {
+      update.$setOnInsert.availableAmount = 1_000_000;
+    }
+
+    const user = await User.findOneAndUpdate({ op_id: opId }, update, {
+      upsert: true,
+      new: true,
+      lean: true,
     });
-  }
 
-  return sendUserResult(res, user);
-});
-
-app.post("/member/profile", (req, res) => {
-  const { op_id: opId } = req.body || {};
-  const user = getExistingUser(opId);
-
-  if (!user) {
-    return sendError(res, errorCodes.userNotFound, "user not exist");
-  }
-
-  res.json({
-    header: makeHeader(errorCodes.success, ""),
-    result: {
-      nickname: user.nickname,
-      gender: user.gender,
-    },
-  });
-});
-
-app.post("/order/transfer", (req, res) => {
-  const { op_id: opId, order, action } = req.body || {};
-
-  if (!opId || !order?.trans_no || typeof order.amount !== "number") {
-    return sendError(res, errorCodes.invalidRequest, "invalid transfer payload");
-  }
-
-  const user = getExistingUser(opId);
-  if (!user) {
-    return sendError(res, errorCodes.userNotFound, "user not exist");
-  }
-
-  const transactionKey = `${action}:${order.trans_no}`;
-  const existing = processedTransfers.get(transactionKey);
-  if (existing) {
-    return res.json({
-      header: makeHeader(errorCodes.success, ""),
-      result: existing,
+    res.json({
+      ok: true,
+      user: normalizeUser(user),
     });
-  }
+  })
+);
 
-  const transferResult = applyTransfer(user, Number(order.amount), transactionKey);
-  if (!transferResult.ok) {
-    return sendError(res, transferResult.code, transferResult.msg, {
-      result: {
-        op_id: user.op_id,
-        availableAmount: user.availableAmount,
-      },
+app.get(
+  "/api/dev/users",
+  asyncHandler(async (req, res) => {
+    const [users, processedTransfers, processedBatchTransfers, businessEvents] = await Promise.all([
+      User.find().sort({ updatedAt: -1 }).lean(),
+      Transfer.find({ kind: "single" }).sort({ updatedAt: -1 }).lean(),
+      Transfer.find({ kind: "batch" }).sort({ updatedAt: -1 }).lean(),
+      BusinessEvent.find().sort({ createdAt: -1 }).limit(200).lean(),
+    ]);
+
+    res.json({
+      users: users.map(normalizeUser),
+      processedTransfers: processedTransfers.map((item) => ({
+        transactionKey: item.transactionKey,
+        result: item.result,
+        action: item.action,
+        trans_no: item.trans_no,
+        amount: item.amount,
+      })),
+      processedBatchTransfers: processedBatchTransfers.map((item) => ({
+        transactionKey: item.transactionKey,
+        action: item.action,
+        trans_no: item.trans_no,
+        batchResult: item.batchResult,
+      })),
+      businessEvents,
     });
-  }
+  })
+);
 
-  return res.json({
-    header: makeHeader(errorCodes.success, ""),
-    result: transferResult,
-  });
-});
-
-app.post("/order/batch_transfer", (req, res) => {
-  const { action, trans_no: batchTransNo, orders } = req.body || {};
-
-  if (!batchTransNo || !Array.isArray(orders)) {
-    return sendError(res, errorCodes.invalidRequest, "invalid batch transfer payload");
-  }
-
-  const batchKey = `${action}:${batchTransNo}`;
-  const cached = processedBatchTransfers.get(batchKey);
-  if (cached) {
-    return res.json(cached);
-  }
-
-  const results = [];
-  let allFailed = true;
-
-  for (const order of orders) {
-    const user = getExistingUser(order.op_id);
+app.post(
+  "/balance/get",
+  asyncHandler(async (req, res) => {
+    const { op_id: opId } = req.body || {};
+    const user = await getExistingUser(opId);
 
     if (!user) {
-      results.push({
-        code: errorCodes.userNotFound,
-        op_id: order.op_id,
-        availableAmount: 0,
+      return sendError(res, errorCodes.userNotFound, "user not exist", {
+        result: {
+          op_id: opId || "",
+          availableAmount: 0,
+        },
       });
-      continue;
     }
 
-    const transferKey = `${action}:${order.trans_no}`;
-    const existing = processedTransfers.get(transferKey);
-    if (existing) {
+    return sendUserResult(res, user);
+  })
+);
+
+app.post(
+  "/member/profile",
+  asyncHandler(async (req, res) => {
+    const { op_id: opId } = req.body || {};
+    const user = await getExistingUser(opId);
+
+    if (!user) {
+      return sendError(res, errorCodes.userNotFound, "user not exist");
+    }
+
+    res.json({
+      header: makeHeader(errorCodes.success, ""),
+      result: {
+        nickname: user.nickname,
+        gender: user.gender,
+      },
+    });
+  })
+);
+
+app.post(
+  "/order/transfer",
+  asyncHandler(async (req, res) => {
+    const { op_id: opId, order, action } = req.body || {};
+
+    if (!opId || !order?.trans_no || typeof order.amount !== "number") {
+      return sendError(res, errorCodes.invalidRequest, "invalid transfer payload");
+    }
+
+    const user = await getExistingUser(opId);
+    if (!user) {
+      return sendError(res, errorCodes.userNotFound, "user not exist");
+    }
+
+    const transactionKey = `${action}:${order.trans_no}`;
+    const transferResult = await applySingleTransfer({
+      user,
+      amount: Number(order.amount),
+      transactionKey,
+      action,
+      transNo: order.trans_no,
+    });
+
+    if (!transferResult.ok) {
+      const currentUser = await getExistingUser(opId);
+      return sendError(res, transferResult.code, transferResult.msg, {
+        result: {
+          op_id: opId,
+          availableAmount: currentUser?.availableAmount ?? 0,
+        },
+      });
+    }
+
+    return res.json({
+      header: makeHeader(errorCodes.success, ""),
+      result: {
+        op_id: transferResult.op_id,
+        availableAmount: transferResult.availableAmount,
+      },
+    });
+  })
+);
+
+app.post(
+  "/order/batch_transfer",
+  asyncHandler(async (req, res) => {
+    const { action, trans_no: batchTransNo, orders } = req.body || {};
+
+    if (!batchTransNo || !Array.isArray(orders)) {
+      return sendError(res, errorCodes.invalidRequest, "invalid batch transfer payload");
+    }
+
+    const batchKey = `${action}:${batchTransNo}`;
+    const cached = await getStoredBatchTransfer(batchKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const results = [];
+    let allFailed = true;
+
+    for (const order of orders) {
+      const user = await getExistingUser(order.op_id);
+
+      if (!user) {
+        results.push({
+          code: errorCodes.userNotFound,
+          op_id: order.op_id,
+          availableAmount: 0,
+        });
+        continue;
+      }
+
+      const transferResult = await applySingleTransfer({
+        user,
+        amount: Number(order.amount),
+        transactionKey: `${action}:${order.trans_no}`,
+        action,
+        transNo: order.trans_no,
+      });
+
+      if (!transferResult.ok) {
+        const currentUser = await getExistingUser(order.op_id);
+        results.push({
+          code: transferResult.code,
+          op_id: order.op_id,
+          availableAmount: currentUser?.availableAmount ?? 0,
+        });
+        continue;
+      }
+
       results.push({
         code: errorCodes.success,
-        ...existing,
+        op_id: transferResult.op_id,
+        availableAmount: transferResult.availableAmount,
       });
       allFailed = false;
-      continue;
     }
 
-    const transferResult = applyTransfer(user, Number(order.amount), transferKey);
-    if (!transferResult.ok) {
-      results.push({
-        code: transferResult.code,
-        op_id: user.op_id,
-        availableAmount: user.availableAmount,
-      });
-      continue;
-    }
+    const payload = {
+      header: makeHeader(
+        allFailed ? errorCodes.invalidRequest : errorCodes.success,
+        allFailed ? "all batch transfer items failed" : ""
+      ),
+      result: {
+        data: results,
+      },
+    };
 
-    results.push({
-      code: errorCodes.success,
-      op_id: user.op_id,
-      availableAmount: user.availableAmount,
+    await storeBatchTransfer({
+      transactionKey: batchKey,
+      action,
+      transNo: batchTransNo,
+      batchResult: payload,
     });
-    allFailed = false;
-  }
 
-  const payload = {
-    header: makeHeader(
-      allFailed ? errorCodes.invalidRequest : errorCodes.success,
-      allFailed ? "all batch transfer items failed" : ""
-    ),
-    result: {
-      data: results,
-    },
-  };
+    res.json(payload);
+  })
+);
 
-  processedBatchTransfers.set(batchKey, payload);
-  res.json(payload);
-});
+app.post(
+  "/order/business",
+  asyncHandler(async (req, res) => {
+    await BusinessEvent.create({
+      payload: req.body,
+    });
+    await trimBusinessEvents();
 
-app.post("/order/business", (req, res) => {
-  businessEvents.push({
-    receivedAt: new Date().toISOString(),
-    payload: req.body,
-  });
+    res.json({
+      header: makeHeader(errorCodes.success, ""),
+    });
+  })
+);
 
-  if (businessEvents.length > 200) {
-    businessEvents.shift();
-  }
-
-  res.json({
-    header: makeHeader(errorCodes.success, ""),
-  });
-});
-
-app.post("/api/2j/create-user", async (req, res) => {
-  try {
+app.post(
+  "/api/2j/create-user",
+  asyncHandler(async (req, res) => {
     const { op_id: opId, user_info: userInfo = {} } = req.body || {};
 
     if (!opId) {
       return sendError(res, errorCodes.invalidRequest, "op_id is required");
     }
 
-    const user = upsertUserFromProfile({
+    const user = await upsertUserFromProfile({
       op_id: opId,
       user_info: {
         nickname: userInfo.nickname || opId,
@@ -530,23 +746,30 @@ app.post("/api/2j/create-user", async (req, res) => {
 
     const response = await postTo2J("/open2j/c/create", payload);
     res.json(response);
-  } catch (error) {
-    res.status(500).json({
-      error: error.message,
-      response: error.response || null,
-    });
-  }
-});
+  })
+);
 
-app.post("/api/2j/launch-game", async (req, res) => {
-  try {
-    const { op_id: opId, game_id: gameId, lang, backlink, device_type: deviceType, device_id: deviceId, ret_lobby_btn: retLobbyBtn, full_screen: fullScreen, auto_create_account: autoCreateAccount, keep_token: keepToken } = req.body || {};
+app.post(
+  "/api/2j/launch-game",
+  asyncHandler(async (req, res) => {
+    const {
+      op_id: opId,
+      game_id: gameId,
+      lang,
+      backlink,
+      device_type: deviceType,
+      device_id: deviceId,
+      ret_lobby_btn: retLobbyBtn,
+      full_screen: fullScreen,
+      auto_create_account: autoCreateAccount,
+      keep_token: keepToken,
+    } = req.body || {};
 
     if (!opId || !gameId) {
       return sendError(res, errorCodes.invalidRequest, "op_id and game_id are required");
     }
 
-    const user = getOrCreateUser(opId);
+    const user = await getOrCreateUser(opId);
 
     const payload = {
       op_id: user.op_id,
@@ -569,16 +792,12 @@ app.post("/api/2j/launch-game", async (req, res) => {
 
     const response = await postTo2J("/open2j/c/launch", payload);
     res.json(response);
-  } catch (error) {
-    res.status(500).json({
-      error: error.message,
-      response: error.response || null,
-    });
-  }
-});
+  })
+);
 
-app.post("/api/2j/evict-user", async (req, res) => {
-  try {
+app.post(
+  "/api/2j/evict-user",
+  asyncHandler(async (req, res) => {
     const { op_id: opId } = req.body || {};
     if (!opId) {
       return sendError(res, errorCodes.invalidRequest, "op_id is required");
@@ -588,16 +807,12 @@ app.post("/api/2j/evict-user", async (req, res) => {
       op_id: opId,
     });
     res.json(response);
-  } catch (error) {
-    res.status(500).json({
-      error: error.message,
-      response: error.response || null,
-    });
-  }
-});
+  })
+);
 
-app.post("/api/2j/detect-user-gaming", async (req, res) => {
-  try {
+app.post(
+  "/api/2j/detect-user-gaming",
+  asyncHandler(async (req, res) => {
     const { op_id: opId } = req.body || {};
     if (!opId) {
       return sendError(res, errorCodes.invalidRequest, "op_id is required");
@@ -607,23 +822,85 @@ app.post("/api/2j/detect-user-gaming", async (req, res) => {
       op_id: opId,
     });
     res.json(response);
-  } catch (error) {
-    res.status(500).json({
-      error: error.message,
-      response: error.response || null,
-    });
-  }
-});
+  })
+);
 
 app.use((error, req, res, next) => {
-  res.status(500).json({
-    header: makeHeader(500, error.message || "internal error"),
+  const is2JError = Boolean(error.response);
+  const status = is2JError ? 502 : 500;
+
+  res.status(status).json({
+    header: makeHeader(status, error.message || "internal error"),
+    response: error.response || null,
   });
 });
 
-const server = app.listen(port, () => {
-  console.log(`2J integration server listening on port ${port}`);
-});
+async function connectDatabase() {
+  if (mongoose.connection.readyState === 1) {
+    return mongoose.connection;
+  }
 
-server.keepAliveTimeout = 120 * 1000;
-server.headersTimeout = 120 * 1000;
+  await mongoose.connect(config.mongoUri, config.mongoDbName ? { dbName: config.mongoDbName } : {});
+  return mongoose.connection;
+}
+
+async function disconnectDatabase() {
+  if (mongoose.connection.readyState === 0) {
+    return;
+  }
+
+  await mongoose.disconnect();
+}
+
+let server = null;
+
+async function start() {
+  await connectDatabase();
+
+  server = app.listen(port, () => {
+    console.log(`2J integration server listening on port ${port}`);
+  });
+
+  server.keepAliveTimeout = 120 * 1000;
+  server.headersTimeout = 120 * 1000;
+
+  return server;
+}
+
+async function stop() {
+  if (server) {
+    await new Promise((resolve, reject) => {
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+    server = null;
+  }
+
+  await disconnectDatabase();
+}
+
+module.exports = {
+  app,
+  config,
+  models: {
+    User,
+    Transfer,
+    BusinessEvent,
+  },
+  start,
+  stop,
+  connectDatabase,
+  disconnectDatabase,
+};
+
+if (require.main === module) {
+  start().catch((error) => {
+    console.error("Failed to start server", error);
+    process.exit(1);
+  });
+}

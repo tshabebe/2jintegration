@@ -22,6 +22,8 @@ Set these in Render before using the live 2J helper endpoints:
 
 ```bash
 APP_BASE_URL=https://twojintegration.onrender.com
+MONGODB_URI=mongodb+srv://<user>:<password>@<cluster>/<db>?retryWrites=true&w=majority
+MONGODB_DB_NAME=2jintegration
 TWOJ_BASE_URL=https://2j.com
 TWOJ_MCH_ID=your_2j_merchant_id
 TWOJ_MERCHANT_KEY=your_2j_merchant_key
@@ -96,6 +98,7 @@ This repo includes a [render.yaml](/home/teshe/projects/2jintegration/render.yam
 
 ## Notes
 
-- The wallet state is currently in-memory. A restart clears users, balances, and transfer history.
-- Transfer idempotency is handled in-memory by `action + trans_no`.
+- Wallet users, transfer idempotency, and business events are now stored in MongoDB through Mongoose.
+- `MONGODB_URI` is required in production unless you are intentionally using a local Mongo instance.
+- Transfer idempotency is persisted by transaction key in MongoDB, so duplicate callbacks survive restarts.
 - The 2J signing logic is based on the 2J API support documentation at `https://2j.com/api-support/en/` and the API pages under `/api/`.
