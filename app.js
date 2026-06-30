@@ -80,31 +80,10 @@ function makeHeader(code = 0, msg = "") {
   };
 }
 
-function sortObject(value) {
-  if (Array.isArray(value)) {
-    return value.map(sortObject);
-  }
-
-  if (value && typeof value === "object") {
-    return Object.keys(value)
-      .sort()
-      .reduce((accumulator, key) => {
-        accumulator[key] = sortObject(value[key]);
-        return accumulator;
-      }, {});
-  }
-
-  return value;
-}
-
-function stableJson(value) {
-  return JSON.stringify(sortObject(value));
-}
-
-function compute2JSign(body, timestamp, key) {
+function compute2JSign(bodyText, timestamp, key) {
   return crypto
     .createHash("md5")
-    .update(stableJson(body))
+    .update(bodyText)
     .update(String(timestamp))
     .update(key)
     .digest("hex");
@@ -313,7 +292,8 @@ async function postTo2J(pathname, body) {
   }
 
   const timestamp = nowMs();
-  const sign = compute2JSign(body, timestamp, config.merchantKey);
+  const bodyText = JSON.stringify(body);
+  const sign = compute2JSign(bodyText, timestamp, config.merchantKey);
   const url = build2JUrl(pathname, timestamp, sign);
 
   const response = await fetch(url, {
@@ -321,7 +301,7 @@ async function postTo2J(pathname, body) {
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(body),
+    body: bodyText,
   });
 
   const text = await response.text();
