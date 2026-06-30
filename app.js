@@ -369,6 +369,37 @@ function buildGameArtSvg(game) {
 </svg>`;
 }
 
+function deriveGameCategory(game) {
+  const text = `${game.englishName} ${game.chineseName} ${game.lines} ${game.panel}`.toLowerCase();
+
+  if (text.includes("fish")) {
+    return "Fish";
+  }
+  if (text.includes("bingo")) {
+    return "Bingo";
+  }
+  if (text.includes("mahjong")) {
+    return "Mahjong";
+  }
+  if (text.includes("dragon & tiger")) {
+    return "Arcade Table";
+  }
+  if (text.includes("cascading")) {
+    return "Cascade Slot";
+  }
+  if (text.includes("megaways") || text.includes("ways")) {
+    return "Ways Slot";
+  }
+  if (text.includes("line")) {
+    return "Line Slot";
+  }
+  if (text.includes("multiple")) {
+    return "Arcade Reel";
+  }
+
+  return "Slot";
+}
+
 function renderLoginPage(errorMessage = "") {
   const errorBlock = errorMessage
     ? `<p class="error">${escapeHtml(errorMessage)}</p>`
@@ -549,6 +580,7 @@ function renderLobbyPage({ user, games }) {
     .map((game) => {
       const title = escapeHtml(game.englishName || game.chineseName || `Game ${game.gameId}`);
       const subtitle = escapeHtml(game.chineseName || game.englishName || "");
+      const category = escapeHtml(deriveGameCategory(game));
       const meta = [
         game.rtp ? `RTP ${escapeHtml(game.rtp)}` : "",
         game.lines ? escapeHtml(game.lines) : "",
@@ -566,11 +598,12 @@ function renderLobbyPage({ user, games }) {
         <div class="card-body">
           <div class="card-topline">
             <span class="game-id">#${game.gameId}</span>
-            <span class="game-publish">${escapeHtml(game.publishTime || "")}</span>
+            <span class="game-category">${category}</span>
           </div>
           <h2>${title}</h2>
           <p class="subtitle">${subtitle}</p>
           <p class="meta">${meta}</p>
+          <p class="publish">${escapeHtml(game.publishTime || "")}</p>
           <a class="play" href="/lobby/play/${game.gameId}">Play Now</a>
         </div>
       </article>`;
@@ -712,9 +745,17 @@ function renderLobbyPage({ user, games }) {
       .card-topline {
         display: flex;
         justify-content: space-between;
+        align-items: center;
         gap: 10px;
         color: rgba(22,17,13,0.62);
         font-size: 0.82rem;
+      }
+      .game-category {
+        padding: 5px 10px;
+        border-radius: 999px;
+        background: rgba(162, 71, 21, 0.1);
+        color: #7d330f;
+        font-weight: 700;
       }
       h2 {
         margin: 10px 0 6px;
@@ -727,9 +768,14 @@ function renderLobbyPage({ user, games }) {
       }
       .meta {
         min-height: 2.7em;
-        margin: 12px 0 16px;
+        margin: 12px 0 10px;
         font-size: 0.88rem;
         color: rgba(22,17,13,0.68);
+      }
+      .publish {
+        margin: 0 0 16px;
+        font-size: 0.82rem;
+        color: rgba(22,17,13,0.52);
       }
       .play {
         display: inline-block;
